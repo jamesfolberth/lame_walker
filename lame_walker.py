@@ -4,7 +4,7 @@ and copy the converted file to a clone directory.  It looks like `lame` uses
 a single thread, so we'll use `multiprocessing` to run transcoding in parallel.
 """
 
-import os, shutil
+import os, shutil, string
 import subprocess
 import multiprocessing as mp
 import argparse
@@ -40,7 +40,7 @@ class ConverterProducer(mp.Process):
       os.makedirs(self.aoutdir)
 
     if os.path.samefile(self.aindir, self.aoutdir):
-      #TODO JMF 2017/04/23: allow overwriting indir's files?
+      #TODO JMF 2017/04/23: allow overwriting indir's files, or name `outdir`?
       raise ValueError('The input and output directory cannot be the '
           'same (for now).')
 
@@ -125,7 +125,11 @@ class ConverterConsumer(mp.Process):
                 
                 #TODO JMF 2017/04/23: lame stuff
                 #TODO JMF 2017/04/23: what's the best function to use here?
-                subprocess.call(['lame', '--quiet', '--abr', '160', '-b', '96', inf, outf_wrk])
+                #subprocess.call(['lame', '--quiet', '--abr', '160', '-b', '96', inf, outf_wrk])
+                lame_args = ['lame']
+                lame_args.extend(self.args.lame_args.split())
+                lame_args.extend((inf, outf_wrk))
+                subprocess.call(lame_args)
                 
               elif ext.lower()[1:] in image_ext:
                 if self.args.verbose or self.args.dry_run: print('copy'+base_msg)
@@ -196,7 +200,8 @@ if __name__ == '__main__':
 
 
   #TODO JMF 2017/04/23: lame parameters here, with sane defaults
-  # lame args
+  parser.add_argument('--lame-args', type=str, default='--quiet --abr 160 -b 96',
+      help='The optional arguments pased to `lame`.')
 
   args = parser.parse_args()
 
