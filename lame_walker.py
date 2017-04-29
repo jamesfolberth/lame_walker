@@ -4,7 +4,7 @@ and copy the converted file to a clone directory.  It looks like `lame` uses
 a single thread, so we'll use `multiprocessing` to run transcoding in parallel.
 """
 
-import os, shutil, string
+import os, shutil, string, time, re
 import subprocess
 import multiprocessing as mp
 import multiprocessing.queues # to subclass mp.Queue()
@@ -13,7 +13,6 @@ import curses
 import argparse
 
 # for debug/dev only
-import time
 from pprint import pprint
   
 # For cross-platform colors in terminal
@@ -129,11 +128,15 @@ class ConverterProducer(mp.Process):
           text = 'copy:\n      {1:>{0}}\n  -->  {2:>{0}}'.format(
               max_len, state['infile'], state['outfile'])
         
-        #TODO JMF 2017/04/29: get info from transcoder's pipe
         elif op == 'transcode':
           max_len = max(len(state['infile']), len(state['outfile'])) # to right align
           text = 'transcode:\n      {1:>{0}}\n  -->  {2:>{0}}'.format(
               max_len, state['infile'], state['outfile'])
+ 
+          if 'hist' in state:
+            text += '\n'+state['hist']
+            #text = state['hist']
+
         else:
           text = ''
         msgs.append((worker, text))
@@ -192,6 +195,49 @@ class ConverterConsumer(mp.Process):
     
     # extension to use when we're still working on the output file
     self.extension = '.wrk'
+    
+    # From http://stackoverflow.com/a/38662876  
+    self.ansi_escape = re.compile(r'(\x9B|\x1B\[)[0-?]*[ -\/]*[@-~]')
+
+  def read_proc_stdout(self, proc, inf, outf):
+    disptime = self.args.disptime
+    
+    # Assume header is 6 lines
+    header = ''
+    for i in range(6):
+      line = proc.stdout.readline().decode()
+      line = self.ansi_escape.sub('', line)
+      header += line
+   
+    _last_time = time.time()
+    lines = []
+    for line in proc.stdout:
+      line = self.ansi_escape.sub('', line.decode())
+      
+      # The 'last' line contains the bitrate and other info \r frame, percentage, timing, info
+      #TODO JMF 2017/04/29: this will probably break.  Make a regex for that type of line
+      #     view it with print(repr(line)) to see what's under the hood
+      if '\r' in line:
+        last_line, begin_line = line.split('\r')
+        lines.append(last_line)
+        hist = header + ''.join(lines)
+        lines.clear()
+        lines.append(begin_line)
+
+        self.info_q.put({'pid': self.pid,
+                         'msg': {'op': 'transcode',
+                                 'infile': inf,
+                                 'outfile': outf,
+                                 'hist': hist
+                                 }
+                         })
+
+      else:
+        lines.append(line)
+      
+    proc.wait()
+
+
   
   def run(self):
     image_ext = frozenset(['jpg', 'png'])
@@ -201,6 +247,7 @@ class ConverterConsumer(mp.Process):
 
         item = self.files_q.get(block=True)
         if item is None: # sentinel
+          #TODO JMF 2017/04/29: put sentinel on info_q
           return 
 
         if 'newpath' in item and 'infilenames' in item and 'outfilenames' in item:
@@ -249,7 +296,6 @@ class ConverterConsumer(mp.Process):
               ext = os.path.splitext(outf)[1]
 
               if ext.lower()[1:] == 'mp3':
-                #TODO JMF 2017/04/23: this is pretty sloppy; clean it up
                 if self.args.verbose or self.args.dry_run: print('transcode'+base_msg)
                 if self.args.dry_run: continue
                 self.info_q.put({'pid': self.pid,
@@ -267,13 +313,13 @@ class ConverterConsumer(mp.Process):
                 #subprocess.call(['lame', '--quiet', '--abr', '160', '-b', '96', inf, outf_wrk])
                 lame_args = ['lame']
                 lame_args.extend(self.args.lame_args.split())
+                lame_args.extend(('--disptime', str(self.args.disptime)))
                 lame_args.extend((inf, outf_wrk))
-                subprocess.call(lame_args)
+                #subprocess.call(lame_args)
                 
-                #TODO JMF 2017/04/25: put file percentages on a Q to the producer to print?
-                #proc = subprocess.Popen(lame_args, stdout=subprocess.PIPE)
-                #for line in iter(proc.stdout.readline):
-                #  print(line)
+                proc = subprocess.Popen(lame_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+                self.read_proc_stdout(proc, inf, outf)
                 
               elif ext.lower()[1:] in image_ext:
                 if self.args.verbose or self.args.dry_run: print('copy'+base_msg)
@@ -340,7 +386,7 @@ if __name__ == '__main__':
   parser.add_argument('--queue-size', type=int, default=2*mp.cpu_count(),
       help='The maximum number of items on the queue.')
   #parser.add_argument('--num-workers', type=int, default=mp.cpu_count(),
-  parser.add_argument('--num-workers', type=int, default=2,
+  parser.add_argument('--num-workers', type=int, default=1,
       help='The number of worker processes to run simultaneously.')
   
   # util args
@@ -353,9 +399,12 @@ if __name__ == '__main__':
 
 
   #TODO JMF 2017/04/23: lame parameters here, with sane defaults
-  parser.add_argument('--lame-args', type=str, default='--quiet --abr 160 -b 96',
-  #parser.add_argument('--lame-args', type=str, default='--abr 160 -b 96',
+  #parser.add_argument('--lame-args', type=str, default='--quiet --abr 160 -b 96',
+  parser.add_argument('--lame-args', type=str, default='--abr 160 -b 96',
       help='The optional arguments pased to `lame`.')
+  parser.add_argument('--disptime', type=float, default=0.1,
+      help='The display time to use with `lame`.  This overrides the `--disptime`'
+           ' argument passed in --lame-args.')
 
   args = parser.parse_args()
 
