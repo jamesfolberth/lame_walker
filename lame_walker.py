@@ -7,6 +7,8 @@ a single thread, so we'll use `multiprocessing` to run transcoding in parallel.
 import os, shutil, string
 import subprocess
 import multiprocessing as mp
+import multiprocessing.queues # to subclass mp.Queue()
+import queue
 import argparse
 
 # for debug/dev only
@@ -15,9 +17,39 @@ from pprint import pprint
   
 # For cross-platform colors in terminal
 # https://pypi.python.org/pypi/colorama
+# maybe use (built-in?) `curses`?
+
+class _StateQueue(mp.queues.Queue):
+  """
+  A `put` to this queue will clear it and put a single item.
+  A `get` to this queue will get a single item.
+  """
+  def __init__(self, *args, **kwargs):
+    super().__init__(*args, **kwargs)
+
+    self._state_lock = mp.Lock() # use our own lock so we don't goof up the
+                                 # base queue's sync objects
+
+  def put(self, *args, **kwargs):
+    with self._state_lock:
+      while not self.empty():
+        print('clearing queue')
+        try:
+          super().get(False)
+        except:
+          pass
+      super().put(*args, **kwargs)
+  
+  def get(self, *args, **kwargs):
+    with self._state_lock:
+      return super().get(*args, **kwargs)
+
+def StateQueue(maxsize=0):
+  return _StateQueue(maxsize, ctx=mp.get_context())
+
 
 class ConverterProducer(mp.Process):
-  def __init__(self, args, q):
+  def __init__(self, args, files_q, info_qs=[]):
     super().__init__()
     
     self.args = args
@@ -27,7 +59,12 @@ class ConverterProducer(mp.Process):
     self.aindir = os.path.abspath(self.indir)
     self.aoutdir = os.path.abspath(self.outdir)
 
-    self.q = q
+    self.files_q = files_q
+    self.files_q_timeout = 0.1 # seconds
+
+    self.info_qs = info_qs
+
+    self.worker_states = {}
 
     self.checkArgs()
 
@@ -57,18 +94,65 @@ class ConverterProducer(mp.Process):
     
     for _ in range(self.args.num_workers):
       yield None # sentinel
+
+  def update_worker_states(self):
+    # Try to get info from the workers' info queues
+    for info_q in self.info_qs:
+      info_item = None
+      try:
+        info_item = info_q.get(False)
+        self.worker_states[info_item['pid']] = info_item['msg']
+      except queue.Empty:
+        pass
   
+  def print_states(self):
+    if not (self.args.verbose or self.args.dry_run):
+      msgs = []
+      for worker, state in self.worker_states.items():
+        op = state.get('op', '')
+        if op == 'mkdir':
+          msgs.append((worker, 'mkdir'))
+        elif op == 'rm':
+          msgs.append(('rm failed file'))
+        elif op == 'transcode':
+          msgs.append((worker, 'transcode'))
+        elif op == 'copy':
+          msgs.append((worker, 'copying'))
+        else:
+          msgs.append((worker, op))
+      
+      msgs.sort(key=lambda t: t[0])
+
+      for msg in msgs:
+        print('Worker {0:4d}: {1}'.format(*msg))
+      print()
+
   def run(self):
     for filenames in self.filenames():
-      self.q.put(filenames)
+      put_succeeded = False
+      while not put_succeeded:
+        #print('top of while')
+        # Try to put an item on the file queue, but don't wait block too long
+        try: #TODO JMF 2017/04/29: is there a better way than try/except?
+          #print('trying to put')
+          self.files_q.put(filenames, True, self.files_q_timeout)
+          #print('put succeeded')
+          put_succeeded = True
+        except queue.Full as e: # we didn't put anything on the queue
+          put_succeeded = False
+          #print('put failed')
+
+        self.update_worker_states()
+        self.print_states() 
 
 
 class ConverterConsumer(mp.Process):
-  def __init__(self, args, q):
+  def __init__(self, args, files_q, info_q=None):
     super().__init__()
     
     self.args = args
-    self.q = q
+    self.files_q = files_q
+    self.info_q = info_q
     
     # extension to use when we're still working on the output file
     self.extension = '.wrk'
@@ -79,7 +163,7 @@ class ConverterConsumer(mp.Process):
     while True:
       try:
 
-        item = self.q.get(block=True)
+        item = self.files_q.get(block=True)
         if item is None: # sentinel
           return 
 
@@ -95,6 +179,11 @@ class ConverterConsumer(mp.Process):
             else:
               if not self.args.clean:
                 if self.args.verbose: print(msg)
+                self.info_q.put({'pid': self.pid, 
+                                 'msg': {'op': 'mkdir',
+                                         'newpath': newpath
+                                         }
+                                 })
                 os.makedirs(newpath)
           
           # loop over files
@@ -108,6 +197,11 @@ class ConverterConsumer(mp.Process):
               if self.args.clean or self.args.verbose or self.args.dry_run: 
                 print(msg)
               if self.args.clean or not self.args.dry_run:
+                self.info_q.put({'pid': self.pid,
+                                 'msg': {'op': 'rm',
+                                         'file': outf+self.extension
+                                         }
+                                 })
                 os.unlink(outf+self.extension)
             
             # do work: transcode mp3; copy jpg and png
@@ -117,11 +211,20 @@ class ConverterConsumer(mp.Process):
             else:
               outf_wrk = outf+self.extension
               ext = os.path.splitext(outf)[1]
-              
+
               if ext.lower()[1:] == 'mp3':
                 #TODO JMF 2017/04/23: this is pretty sloppy; clean it up
                 if self.args.verbose or self.args.dry_run: print('transcode'+base_msg)
                 if self.args.dry_run: continue
+                self.info_q.put({'pid': self.pid,
+                                 'msg': {'op': 'transcode',
+                                         'infile': inf,
+                                         'outfile': outf
+                                         }
+                                 })
+
+                #TODO JMF 2017/04/25: if bitrate is less than target average bitrate, then 
+                #                     don't transcode.
                 
                 #TODO JMF 2017/04/23: lame stuff
                 #TODO JMF 2017/04/23: what's the best function to use here?
@@ -131,10 +234,21 @@ class ConverterConsumer(mp.Process):
                 lame_args.extend((inf, outf_wrk))
                 subprocess.call(lame_args)
                 
+                #TODO JMF 2017/04/25: put file percentages on a Q to the producer to print?
+                #proc = subprocess.Popen(lame_args, stdout=subprocess.PIPE)
+                #for line in iter(proc.stdout.readline):
+                #  print(line)
+                
               elif ext.lower()[1:] in image_ext:
                 if self.args.verbose or self.args.dry_run: print('copy'+base_msg)
                 if self.args.dry_run: continue
- 
+                self.info_q.put({'pid': self.pid,
+                                 'msg': {'op': 'copy',
+                                         'infile': inf,
+                                         'outfile': outf
+                                         }
+                                 })
+
                 shutil.copy2(inf, outf_wrk)
               
               else:
@@ -152,15 +266,18 @@ class ConverterConsumer(mp.Process):
 
 def main(args):
   # initialize
-  q = mp.Queue(args.queue_size)
+  files_q = mp.Queue(args.queue_size)
 
-  producer = ConverterProducer(args, q)
-    
   if args.dry_run: args.num_workers = 1 # want predictable output
 
   consumers = []
+  info_qs = [] 
   for _ in range(args.num_workers):
-    consumers.append(ConverterConsumer(args, q))
+    info_q = StateQueue(args.queue_size)
+    info_qs.append(info_q)
+    consumers.append(ConverterConsumer(args, files_q, info_q=info_q))
+  
+  producer = ConverterProducer(args, files_q, info_qs=info_qs)
   
   # start up processes
   producer.start()
@@ -201,6 +318,7 @@ if __name__ == '__main__':
 
   #TODO JMF 2017/04/23: lame parameters here, with sane defaults
   parser.add_argument('--lame-args', type=str, default='--quiet --abr 160 -b 96',
+  #parser.add_argument('--lame-args', type=str, default='--abr 160 -b 96',
       help='The optional arguments pased to `lame`.')
 
   args = parser.parse_args()
