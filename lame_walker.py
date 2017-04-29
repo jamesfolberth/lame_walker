@@ -9,6 +9,7 @@ import subprocess
 import multiprocessing as mp
 import multiprocessing.queues # to subclass mp.Queue()
 import queue
+import curses
 import argparse
 
 # for debug/dev only
@@ -33,7 +34,7 @@ class _StateQueue(mp.queues.Queue):
   def put(self, *args, **kwargs):
     with self._state_lock:
       while not self.empty():
-        print('clearing queue')
+        #print('clearing queue')
         try:
           super().get(False)
         except:
@@ -60,7 +61,7 @@ class ConverterProducer(mp.Process):
     self.aoutdir = os.path.abspath(self.outdir)
 
     self.files_q = files_q
-    self.files_q_timeout = 0.1 # seconds
+    self.files_q_timeout = 0.05 # seconds
 
     self.info_qs = info_qs
 
@@ -81,13 +82,20 @@ class ConverterProducer(mp.Process):
       raise ValueError('The input and output directory cannot be the '
           'same (for now).')
 
+    self.do_curses = not (self.args.verbose or self.args.dry_run)
+
   def filenames(self):
     for dirpath, dirnames, filenames in os.walk(self.indir):
       if filenames: # only care if files exist in dir; don't care about dirnames
         relpath = os.path.relpath(dirpath, self.indir)
+                
+        # absolute paths
+        #infilenames = list(map(lambda fn: os.path.join(self.aindir, relpath, fn), filenames))
+        #outfilenames = list(map(lambda fn: os.path.join(self.aoutdir, relpath, fn), filenames))
         
-        infilenames = list(map(lambda fn: os.path.join(self.aindir, relpath, fn), filenames))
-        outfilenames = list(map(lambda fn: os.path.join(self.aoutdir, relpath, fn), filenames))
+        # relative paths
+        infilenames = list(map(lambda fn: os.path.join(self.indir, relpath, fn), filenames))
+        outfilenames = list(map(lambda fn: os.path.join(self.outdir, relpath, fn), filenames))
         
         yield {'newpath': os.path.join(self.aoutdir, relpath),
             'infilenames': infilenames, 'outfilenames': outfilenames}
@@ -111,40 +119,68 @@ class ConverterProducer(mp.Process):
       for worker, state in self.worker_states.items():
         op = state.get('op', '')
         if op == 'mkdir':
-          msgs.append((worker, 'mkdir'))
-        elif op == 'rm':
-          msgs.append(('rm failed file'))
-        elif op == 'transcode':
-          msgs.append((worker, 'transcode'))
-        elif op == 'copy':
-          msgs.append((worker, 'copying'))
-        else:
-          msgs.append((worker, op))
-      
-      msgs.sort(key=lambda t: t[0])
+          text = 'mkdir:\n  -->   {}'.format(state['newpath'])
 
+        elif op == 'rm':
+          text = 'removing failed file:\n  -->  {}'.format(state['file'])
+
+        elif op == 'copy':
+          max_len = max(len(state['infile']), len(state['outfile'])) # to right align
+          text = 'copy:\n      {1:>{0}}\n  -->  {2:>{0}}'.format(
+              max_len, state['infile'], state['outfile'])
+        
+        #TODO JMF 2017/04/29: get info from transcoder's pipe
+        elif op == 'transcode':
+          max_len = max(len(state['infile']), len(state['outfile'])) # to right align
+          text = 'transcode:\n      {1:>{0}}\n  -->  {2:>{0}}'.format(
+              max_len, state['infile'], state['outfile'])
+        else:
+          text = ''
+        msgs.append((worker, text))
+      
+      msgs.sort(key=lambda t: t[0]) # sort by PID
+      
+      text = ''
+      import time; text = 'time: '+str(time.time())+'\n'
       for msg in msgs:
-        print('Worker {0:4d}: {1}'.format(*msg))
-      print()
+        text += 'Worker {0:4d}:\n{1}\n\n'.format(*msg)
+        
+      # display with curses
+      self.win.erase()
+      try:
+          self.win.addstr(text)
+      except curses.error:
+          pass
+      self.win.refresh()
+
 
   def run(self):
-    for filenames in self.filenames():
-      put_succeeded = False
-      while not put_succeeded:
-        #print('top of while')
-        # Try to put an item on the file queue, but don't wait block too long
-        try: #TODO JMF 2017/04/29: is there a better way than try/except?
-          #print('trying to put')
-          self.files_q.put(filenames, True, self.files_q_timeout)
-          #print('put succeeded')
-          put_succeeded = True
-        except queue.Full as e: # we didn't put anything on the queue
-          put_succeeded = False
-          #print('put failed')
+    # curses stuff adapted from
+    # https://github.com/python/cpython/blob/2.7/Demo/curses/repeat.py
+    if self.do_curses:
+      self.win = curses.initscr()
 
-        self.update_worker_states()
-        self.print_states() 
-
+    try:
+      # main loop
+      for filenames in self.filenames():
+        put_succeeded = False
+        while not put_succeeded:
+          # Try to put an item on the file queue, but don't block too long
+          try: 
+            self.files_q.put(filenames, True, self.files_q_timeout)
+            put_succeeded = True
+          except queue.Full as e: # we didn't put anything on the queue
+            put_succeeded = False
+          
+          if self.do_curses:
+            self.update_worker_states()
+            self.print_states() 
+      
+      #TODO JMF 2017/04/29: keep printing info until all info_q are closed/see sentinel
+      #     will need to make the workers send a sentinel back
+    finally:
+      if self.do_curses:
+        curses.endwin()
 
 class ConverterConsumer(mp.Process):
   def __init__(self, args, files_q, info_q=None):
