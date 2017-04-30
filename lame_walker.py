@@ -4,7 +4,7 @@ and copy the converted file to a clone directory.  It looks like `lame` uses
 a single thread, so we'll use `multiprocessing` to run transcoding in parallel.
 """
 
-import os, shutil, string, re
+import os, shutil, string, re, time
 import subprocess
 import multiprocessing as mp
 import multiprocessing.queues # to subclass mp.Queue()
@@ -15,11 +15,9 @@ import argparse
 # for debug/dev only
 from pprint import pprint
   
-# For cross-platform colors in terminal
-# https://pypi.python.org/pypi/colorama
-# maybe use (built-in?) `curses`?
-
 SENTINEL=None
+LAME_EXT=frozenset(['mp3', 'wav']) #TODO JMF 2017/04/29: what other types does lame handle?
+IMAGE_EXT=frozenset(['jpg', 'png'])
 
 class _StateQueue(mp.queues.Queue):
   """
@@ -34,12 +32,18 @@ class _StateQueue(mp.queues.Queue):
 
   def put(self, *args, **kwargs):
     with self._state_lock:
+      #keep = [] # don't delete these items (bugfix race condition)
       while not self.empty():
-        #print('clearing queue')
         try:
           super().get(False)
+          #item = super().get(False)
+          #if 'msg' in item and item['msg'].get('op', '') == 'transcode_done':
+          #  print('keeping\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n')
+          #  keep.append(item)
         except:
           pass
+      #for item in keep:
+      #  super().put(*args, **kwargs)
       super().put(*args, **kwargs)
   
   def get(self, *args, **kwargs):
@@ -62,7 +66,7 @@ class ConverterProducer(mp.Process):
     self.aoutdir = os.path.abspath(self.outdir)
 
     self.files_q = files_q
-    self.files_q_timeout = 0.05 # seconds
+    self.files_q_timeout = 0.1 # seconds
 
     self.info_qs = info_qs
 
@@ -109,69 +113,145 @@ class ConverterProducer(mp.Process):
     for info_q in self.info_qs:
       try:
         info_item = info_q.get(False)
-        self.worker_states[info_item['pid']] = info_item['msg']
+        if info_item is SENTINEL:
+          continue
+        else:
+          self.worker_states[info_item['pid']] = info_item
       except queue.Empty:
         pass
   
-  def print_states(self):
+  def handle_states(self):
     if not (self.args.verbose or self.args.dry_run):
       msgs = []
+      num_done = 0
       for worker, state in self.worker_states.items():
-        op = state.get('op', '')
+        num_done += state.get('transcodes_done', 0)
+        finished = state.get('finished', False)
+
+        text = ''
+        msg = state.get('msg', {})
+        op = msg.get('op', '')
         if op == 'mkdir':
-          text = 'mkdir:\n  -->   {}'.format(state['newpath'])
+          text = 'mkdir:\n  -->   {}'.format(msg['newpath'])
 
         elif op == 'rm':
-          text = 'removing failed file:\n  -->  {}'.format(state['file'])
+          text = 'removing failed file:\n  -->  {}'.format(msg['file'])
 
         elif op == 'copy':
-          max_len = max(len(state['infile']), len(state['outfile'])) # to right align
+          max_len = max(len(msg['infile']), len(msg['outfile'])) # to right align
           text = 'copy:\n      {1:>{0}}\n  -->  {2:>{0}}'.format(
-              max_len, state['infile'], state['outfile'])
+              max_len, msg['infile'], msg['outfile'])
 
-        elif op == 'transcode_done':
-          self.num_done += 1
-          text = ''
-        
         elif op == 'transcode':
-          max_len = max(len(state['infile']), len(state['outfile'])) # to right align
+          max_len = max(len(msg['infile']), len(msg['outfile'])) # to right align
           text = 'transcode:\n       {1:>{0}}\n  -->  {2:>{0}}'.format(
-              max_len, state['infile'], state['outfile'])
+              max_len, msg['infile'], msg['outfile'])
  
-          if 'hist' in state:
-            text += '\n'+state['hist']
-
-        else:
-          text = ''
-        msgs.append((worker, text))
+          if 'hist' in msg:
+            text += '\n'+msg['hist']
+  
+        if not finished:
+          msgs.append((worker, text))
       
+      self.num_done = num_done
       msgs.sort(key=lambda t: t[0]) # sort by PID
       
       text = 'Percent complete: {2:3.1f}%  ({0:{3}d} of {1:{3}d})\n'.format(
           self.num_done, self.num_todo, 100.*self.num_done/self.num_todo,
           len(str(self.num_todo)))
       text += '-'*len(text)+'\n'
-      for msg in msgs:
-        text += 'Worker {0:4d}:\n{1}\n\n'.format(*msg)
+      for i, msg in enumerate(msgs):
+        text += 'Worker {0:4d}:\n{1}'.format(*msg)
+        if i < len(msgs)-1: text += '\n\n'
+
+
+      # this isn't robust, and probably isn't right
+      lines = text.splitlines()
+      pad_w = max(map(lambda l: len(l), lines))
+      pad_h = len(lines)
+
+      def refresh():
+        self.pad.move(0,0) # always put the cursor at (0,0)
+        self.pad.refresh(self.row,self.col, 0,0, self.win_h-1,self.win_w-1)
         
       # display with curses
-      self.win.erase()
+      if pad_h <= self.pad_h or pad_w <= self.pad_w: self.win.clrtobot()
+      self.pad.erase()
+      self.pad.resize(max(pad_h,self.win_h), max(pad_w,self.win_w))
+      self.pad_h, self.pad_w = pad_h, pad_w
       try:
-          self.win.addstr(text)
+        self.pad.addstr(text)
       except curses.error:
-          pass
-      self.win.refresh()
+        pass
+      
+      refresh()
 
+      # move with curses
+      #self.pad.timeout(0) # immediately try to get input
+      ch = self.pad.getch()
+      while ch != -1:
+        if (ch == curses.KEY_DOWN or ch == ord('j')) and self.row < pad_h - self.win_h:
+          self.row += 1
+
+        elif (ch == curses.KEY_UP or ch == ord('k')) and self.row > 0:
+          self.row -= 1
+
+        elif (ch == curses.KEY_RIGHT or ch == ord('l')) and self.col < pad_w - self.win_w:
+          self.col += 1
+
+        elif (ch == curses.KEY_LEFT or ch == ord('h')) and self.col > 0:
+          self.col -= 1
+
+        elif ch == curses.KEY_NPAGE:
+          self.row = min(self.row+self.win_h, pad_h-self.win_h-1)
+
+        elif ch == curses.KEY_PPAGE:
+          self.row = max(self.row-self.win_h, 0)
+
+        elif ch == curses.KEY_HOME:
+          self.row = 0
+
+        elif ch == curses.KEY_END:
+          self.row = pad_h-self.win_h-1
+        
+        self.pad.redrawwin()
+        refresh()
+
+        ch = self.pad.getch()
+  
+  def init_curses(self):
+    # curses stuff adapted from
+    # https://github.com/python/cpython/blob/2.7/Demo/curses/repeat.py
+    # http://stackoverflow.com/a/18295415
+    self.win = curses.initscr()
+    curses.noecho()
+    self.win.keypad(True)
+    curses.cbreak()
+
+    self.win_h, self.win_w = self.win.getmaxyx()
+    self.pad = curses.newpad(self.win_h,self.win_w)
+    self.pad_h, self.pad_w = self.win_h, self.win_w
+    #self.curses_timeout = 100 # milliseconds
+    #self.pad.timeout(self.curses_timeout)
+    self.pad.timeout(0)
+    self.row = 0; self.col = 0;
+    self.pad.scrollok(True)
+    self.pad.keypad(True)
+
+  def finish_curses(self):
+    curses.nocbreak()
+    self.pad.keypad(False)
+    curses.echo()
+    curses.endwin()
 
   def run(self):
     self.num_done = 0
-    self.num_todo = sum(map(lambda f: len(f['infilenames']) if f is not SENTINEL else 0,
+    self.num_todo = sum(map(lambda fns:\
+        sum((os.path.splitext(fn)[1].lower()[1:] in LAME_EXT) for fn in fns['infilenames'])\
+        if fns is not SENTINEL else 0,
         self.filenames()))
 
-    # curses stuff adapted from
-    # https://github.com/python/cpython/blob/2.7/Demo/curses/repeat.py
-    if self.do_curses:
-      self.win = curses.initscr()
+    if self.do_curses: self.init_curses()
 
     try:
       # main loop
@@ -187,13 +267,18 @@ class ConverterProducer(mp.Process):
           
           if self.do_curses:
             self.update_worker_states()
-            self.print_states() 
+            self.handle_states() 
       
-      #TODO JMF 2017/04/29: keep printing info until all info_q are closed/see sentinel
-      #     will need to make the workers send a sentinel back
+      # if main loop finished normally, keep printing info until all workers are done
+      else:
+        while not all(map(lambda s: s['finished'], self.worker_states.values())):
+          self.update_worker_states()
+          self.handle_states()
+          time.sleep(self.args.disptime)
+
     finally:
-      if self.do_curses:
-        curses.endwin()
+      if self.do_curses: self.finish_curses()
+
 
 class ConverterConsumer(mp.Process):
   def __init__(self, args, files_q, info_q=None):
@@ -205,25 +290,20 @@ class ConverterConsumer(mp.Process):
     
     # extension to use when we're still working on the output file
     self.extension = '.wrk'
+
+    self.transcodes_done = 0
+    self.finished = False
     
     # From http://stackoverflow.com/a/38662876  
     self.ansi_escape = re.compile(r'(\x9B|\x1B\[)[0-?]*[ -\/]*[@-~]')
 
-    self.lame_header = re.compile(r'^\s*Frame\s*\|\s*CPU time/estim\s*\|\s*REAL time/estim\s*\|\s*play/CPU\s*\|\s*ETA')
+    self.lame_header = re.compile(r'^\s*Frame\s*\|\s*CPU time/estim\s*\|\s*REAL '
+        'time/estim\s*\|\s*play/CPU\s*\|\s*ETA')
     self.kbps_footer = re.compile(r'^\s*kbps\s*LR\s*MS\*\%')
 
   def read_proc_stdout(self, proc, inf, outf):
-    #disptime = self.args.disptime
     
-    # Assume header is 6 lines
-    #TODO JMF 2017/04/29: regex for this
-    #header = ''
-    #for i in range(6):
-    #  line = proc.stdout.readline().decode()
-    #  line = self.ansi_escape.sub('', line)
-    #  print(line)
-    #  header += line
-
+    # parse out (and remove) the lame header
     header = ''
     while True:
       line = proc.stdout.readline().decode()
@@ -237,7 +317,9 @@ class ConverterConsumer(mp.Process):
       header += line
 
     lines = [line]
-   
+    
+    # parse out what lame is repeatedly printing.
+    # this is a bit of a hack
     for line in proc.stdout:
       line = self.ansi_escape.sub('', line.decode())
       
@@ -247,35 +329,38 @@ class ConverterConsumer(mp.Process):
       if '\r' in line:
         last_line, begin_line = line.split('\r')
         lines.append(last_line)
-        #hist = header + ''.join(lines)
-        hist = ''.join(lines)
-        #print(repr(hist))
+        #hist = ''.join(lines)
+        hist = header + ''.join(lines)
+        
         lines.clear()
         lines.append(begin_line)
 
-        self.info_q.put({'pid': self.pid,
-                         'msg': {'op': 'transcode',
-                                 'infile': inf,
-                                 'outfile': outf,
-                                 'hist': hist
-                                 }
-                         })
+        self.send_state_msg({'op': 'transcode',
+                             'infile': inf,
+                             'outfile': outf,
+                             'hist': hist
+                             })
 
       else:
         lines.append(line)
       
     proc.wait()
-
+  
+  def send_state_msg(self, msg={}):
+    self.info_q.put({'pid': self.pid, 
+                     'transcodes_done': self.transcodes_done,
+                     'finished': self.finished,
+                     'msg': msg
+                     })
   
   def run(self):
-    image_ext = frozenset(['jpg', 'png'])
-
     while True:
       try:
 
         item = self.files_q.get(block=True)
         if item is SENTINEL:
-          #TODO JMF 2017/04/29: put sentinel on info_q
+          self.finished = True
+          self.send_state_msg()
           return 
 
         if 'newpath' in item and 'infilenames' in item and 'outfilenames' in item:
@@ -290,17 +375,18 @@ class ConverterConsumer(mp.Process):
             else:
               if not self.args.clean:
                 if self.args.verbose: print(msg)
-                self.info_q.put({'pid': self.pid, 
-                                 'msg': {'op': 'mkdir',
-                                         'newpath': newpath
-                                         }
-                                 })
+                self.send_state_msg({'op': 'mkdir',
+                                     'newpath': newpath
+                                    })
                 os.makedirs(newpath)
           
           # loop over files
           for inf, outf in zip(infilenames, outfilenames):
             # skip if outfile already exists
-            if os.path.isfile(outf): continue
+            if os.path.isfile(outf): 
+              self.transcodes_don += 1 # for display only
+              self.send_state_msg()
+              continue
             
             # we failed processing this one earlier; try again
             if os.path.isfile(outf+self.extension):
@@ -308,11 +394,9 @@ class ConverterConsumer(mp.Process):
               if self.args.clean or self.args.verbose or self.args.dry_run: 
                 print(msg)
               if self.args.clean or not self.args.dry_run:
-                self.info_q.put({'pid': self.pid,
-                                 'msg': {'op': 'rm',
-                                         'file': outf+self.extension
-                                         }
-                                 })
+                self.send_state_msg({'op': 'rm',
+                                     'file': outf+self.extension
+                                     })
                 os.unlink(outf+self.extension)
             
             # do work: transcode mp3; copy jpg and png
@@ -323,15 +407,13 @@ class ConverterConsumer(mp.Process):
               outf_wrk = outf+self.extension
               ext = os.path.splitext(outf)[1]
 
-              if ext.lower()[1:] == 'mp3':
+              if ext.lower()[1:] in LAME_EXT:
                 if self.args.verbose or self.args.dry_run: print('transcode'+base_msg)
                 if self.args.dry_run: continue
-                self.info_q.put({'pid': self.pid,
-                                 'msg': {'op': 'transcode',
-                                         'infile': inf,
-                                         'outfile': outf
-                                         }
-                                 })
+                self.send_state_msg({'op': 'transcode',
+                                     'infile': inf,
+                                     'outfile': outf,
+                                     })
 
                 #TODO JMF 2017/04/25: if bitrate is less than target average bitrate, then 
                 #                     don't transcode.
@@ -342,25 +424,24 @@ class ConverterConsumer(mp.Process):
                 #subprocess.call(['lame', '--quiet', '--abr', '160', '-b', '96', inf, outf_wrk])
                 lame_args = ['lame']
                 lame_args.extend(self.args.lame_args.split())
-                #lame_args.extend(('--disptime', str(self.args.disptime)))
+                lame_args.extend(('--disptime', str(self.args.disptime)))
                 lame_args.extend((inf, outf_wrk))
  
                 #subprocess.call(lame_args)
                 proc = subprocess.Popen(lame_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
                 self.read_proc_stdout(proc, inf, outf)
-
-                self.info_q.put({'pid': self.pid, 'msg': {'op': 'transcode_done'}})
                 
-              elif ext.lower()[1:] in image_ext:
+                self.transcodes_done += 1
+                self.send_state_msg()
+                
+              elif ext.lower()[1:] in IMAGE_EXT:
                 if self.args.verbose or self.args.dry_run: print('copy'+base_msg)
                 if self.args.dry_run: continue
-                self.info_q.put({'pid': self.pid,
-                                 'msg': {'op': 'copy',
-                                         'infile': inf,
-                                         'outfile': outf
-                                         }
-                                 })
+                self.send_state_msg({'op': 'copy',
+                                     'infile': inf,
+                                     'outfile': outf
+                                     })
 
                 shutil.copy2(inf, outf_wrk)
               
@@ -375,7 +456,6 @@ class ConverterConsumer(mp.Process):
 
 
 #TODO JMF 2017/04/23: <Ctrl-C> grabber, so we can print warning to user then die?
-
 
 def main(args):
   # initialize
@@ -416,7 +496,7 @@ if __name__ == '__main__':
   # multiprocessing args
   parser.add_argument('--queue-size', type=int, default=2*mp.cpu_count(),
       help='The maximum number of items on the queue.')
-  #parser.add_argument('--num-workers', type=int, default=mp.cpu_count()-1,
+  #parser.add_argument('--num-workers', type=int, default=mp.cpu_count(),
   parser.add_argument('--num-workers', type=int, default=1,
       help='The number of worker processes to run simultaneously.')
   
@@ -430,12 +510,13 @@ if __name__ == '__main__':
 
 
   #TODO JMF 2017/04/23: lame parameters here, with sane defaults
-  #parser.add_argument('--lame-args', type=str, default='--quiet --abr 160 -b 96',
-  parser.add_argument('--lame-args', type=str, default='--abr 160 -b 96',
+  #parser.add_argument('--lame-args', type=str, default='--abr 160 -b 96',
+  parser.add_argument('--lame-args', type=str, default='--preset medium',
       help='The optional arguments pased to `lame`.')
-  #parser.add_argument('--disptime', type=float, default=0.1,
-  #    help='The display time to use with `lame`.  This overrides the `--disptime`'
-  #         ' argument passed in --lame-args.')
+  parser.add_argument('--disptime', type=float, default=0.1,
+      help='The time between screen updates, which also overrides the `--disptime`'
+           ' argument passed in --lame-args for `lame`.')
+
 
   args = parser.parse_args()
 
