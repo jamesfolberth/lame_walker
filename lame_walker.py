@@ -171,15 +171,21 @@ class ConverterProducer(mp.Process):
       pad_h = len(lines)
 
       def refresh():
-        self.pad.move(0,0) # always put the cursor at (0,0)
-        self.pad.refresh(self.row,self.col, 0,0, self.win_h-1,self.win_w-1)
+        try:
+          self.pad.move(0,0) # always put the cursor at (0,0)
+          self.pad.refresh(self.row,self.col, 0,0, self.win_h-1,self.win_w-1)
+        except curses.error as e:
+          pass
         
       # display with curses
-      if pad_h <= self.pad_h or pad_w <= self.pad_w: self.win.clrtobot()
-      self.pad.erase()
-      self.pad.resize(max(pad_h,self.win_h), max(pad_w,self.win_w))
-      self.pad_h, self.pad_w = pad_h, pad_w
       try:
+        if pad_h <= self.pad_h or pad_w <= self.pad_w: self.win.clrtobot()
+
+        self.pad.erase()
+        #TODO this creaashes on X window resize
+        self.pad.resize(max(pad_h,self.win_h), max(pad_w,self.win_w))
+        self.pad_h, self.pad_w = pad_h, pad_w
+
         self.pad.addstr(text)
       except curses.error:
         pass
@@ -187,7 +193,6 @@ class ConverterProducer(mp.Process):
       refresh()
 
       # move with curses
-      #self.pad.timeout(0) # immediately try to get input
       ch = self.pad.getch()
       while ch != -1:
         if (ch == curses.KEY_DOWN or ch == ord('j')) and self.row < pad_h - self.win_h:
@@ -203,7 +208,7 @@ class ConverterProducer(mp.Process):
           self.col -= 1
 
         elif ch == curses.KEY_NPAGE:
-          self.row = min(self.row+self.win_h, pad_h-self.win_h-1)
+          self.row = min(self.row+self.win_h, pad_h-self.win_h)
 
         elif ch == curses.KEY_PPAGE:
           self.row = max(self.row-self.win_h, 0)
@@ -212,7 +217,7 @@ class ConverterProducer(mp.Process):
           self.row = 0
 
         elif ch == curses.KEY_END:
-          self.row = pad_h-self.win_h-1
+          self.row = pad_h-self.win_h
         
         self.pad.redrawwin()
         refresh()
@@ -231,9 +236,7 @@ class ConverterProducer(mp.Process):
     self.win_h, self.win_w = self.win.getmaxyx()
     self.pad = curses.newpad(self.win_h,self.win_w)
     self.pad_h, self.pad_w = self.win_h, self.win_w
-    #self.curses_timeout = 100 # milliseconds
-    #self.pad.timeout(self.curses_timeout)
-    self.pad.timeout(0)
+    self.pad.timeout(10) # milliseconds
     self.row = 0; self.col = 0;
     self.pad.scrollok(True)
     self.pad.keypad(True)
@@ -384,8 +387,9 @@ class ConverterConsumer(mp.Process):
           for inf, outf in zip(infilenames, outfilenames):
             # skip if outfile already exists
             if os.path.isfile(outf): 
-              self.transcodes_don += 1 # for display only
-              self.send_state_msg()
+              if os.path.splitext(outf)[1].lower()[1:] in LAME_EXT:
+                self.transcodes_done += 1 # for display only
+                self.send_state_msg()
               continue
             
             # we failed processing this one earlier; try again
@@ -496,8 +500,7 @@ if __name__ == '__main__':
   # multiprocessing args
   parser.add_argument('--queue-size', type=int, default=2*mp.cpu_count(),
       help='The maximum number of items on the queue.')
-  #parser.add_argument('--num-workers', type=int, default=mp.cpu_count(),
-  parser.add_argument('--num-workers', type=int, default=1,
+  parser.add_argument('--num-workers', type=int, default=mp.cpu_count(),
       help='The number of worker processes to run simultaneously.')
   
   # util args
