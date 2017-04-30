@@ -14,7 +14,9 @@ import curses
 import argparse
 
 SENTINEL=None
-LAME_EXT=frozenset(['mp3', 'wav']) #TODO JMF 2017/04/29: what other types does lame handle?
+LAME_EXT=frozenset(['mp3', 'wav'])
+FAAD_EXT=frozenset(['m4a'])
+TRANS_EXT=LAME_EXT | FAAD_EXT # transcodable extensions
 IMAGE_EXT=frozenset(['jpg', 'png'])
 
 class _StateQueue(mp.queues.Queue):
@@ -97,10 +99,20 @@ class ConverterProducer(mp.Process):
         outfilenames = list(map(lambda fn: os.path.join(self.outdir, relpath, fn), filenames))
         
         yield {'newpath': os.path.join(self.aoutdir, relpath),
-            'infilenames': infilenames, 'outfilenames': outfilenames}
+               'infilenames': infilenames,
+               'outfilenames': outfilenames
+               }
     
     for _ in range(self.args.num_workers):
       yield SENTINEL
+
+  def all_extensions(self):
+    all_ext = set()
+    for fns in self.filenames():
+      if fns is not SENTINEL:
+        for fn in fns['infilenames']:
+          all_ext.add(os.path.splitext(fn)[1].lower()[1:])
+    return all_ext
 
   def update_worker_states(self):
     # Try to get info from the workers' info queues
@@ -129,8 +141,11 @@ class ConverterProducer(mp.Process):
         if op == 'mkdir':
           text = 'mkdir:\n  -->   {}'.format(msg['newpath'])
 
-        elif op == 'rm':
+        elif op == 'rm_failed':
           text = 'removing failed file:\n  -->  {}'.format(msg['file'])
+
+        elif op == 'rm_work':
+          text = 'removing work file:\n  -->  {}'.format(msg['file'])
 
         elif op == 'copy':
           max_len = max(len(msg['infile']), len(msg['outfile'])) # to right align
@@ -255,19 +270,21 @@ class ConverterProducer(mp.Process):
         text = '{3}:\n       {1:>{0}}\n  -->  {2:>{0}}'.format(
             max_len, msg['infile'], msg['outfile'], msg['details'])
         print(text)
+      
+      elif t == 'unhandled_exception':
+        print(msg['exception']) #TODO JMF 2017/04/30: show better info
 
       else:
         pprint(msg)
       print()
 
-
   def run(self):
     self.num_done = 0
     self.num_todo = sum(map(lambda fns:\
-        sum((os.path.splitext(fn)[1].lower()[1:] in LAME_EXT) for fn in fns['infilenames'])\
+        sum((os.path.splitext(fn)[1].lower()[1:] in TRANS_EXT) for fn in fns['infilenames'])\
         if fns is not SENTINEL else 0,
         self.filenames()))
-
+    
     if self.do_curses: self.init_curses()
 
     try:
@@ -365,6 +382,8 @@ class ConverterConsumer(mp.Process):
     proc.wait()
   
   def send_state_msg(self, msg={}):
+    if self.args.verbose: return # don't use curses in verbose mode
+
     self.info_q.put({'pid': self.pid, 
                      'transcodes_done': self.transcodes_done,
                      'finished': self.finished,
@@ -372,6 +391,10 @@ class ConverterConsumer(mp.Process):
                      })
   
   def run(self):
+    def base_msg(inf, outf):
+      max_len = max(len(inf), len(outf)) # to right align
+      return ':\n       {1:>{0}}\n  -->  {2:>{0}}'.format(max_len, inf, outf)
+
     while True:
       try:
 
@@ -400,59 +423,108 @@ class ConverterConsumer(mp.Process):
           
           # loop over files
           for inf, outf in zip(infilenames, outfilenames):
+            inf_base = os.path.splitext(inf)[0]
+            outf_base = os.path.splitext(outf)[0]
+            outf_wrk = outf_base+self.extension
+            ext = os.path.splitext(inf)[1]
+ 
             # skip if outfile already exists
-            if os.path.isfile(outf): 
-              if os.path.splitext(outf)[1].lower()[1:] in LAME_EXT:
-                self.transcodes_done += 1 # for display only
-                self.send_state_msg()
+            if os.path.isfile(outf):
+              if not self.args.dry_run:
+                if os.path.splitext(outf)[1].lower()[1:] in LAME_EXT:
+                  self.transcodes_done += 1 # for display only
+                  self.send_state_msg()
               continue
             
-            # we failed processing this one earlier; try again
-            if os.path.isfile(outf+self.extension):
-              msg = 'removing failed file:\n  -->  {}'.format(outf+self.extension)
+            # we failed transcoding this one earlier; try again
+            if os.path.isfile(outf_base+self.extension):
+              msg = 'removing failed file:\n  -->  {}'.format(outf_base+self.extension)
               if self.args.clean or self.args.verbose or self.args.dry_run: 
                 print(msg)
               if self.args.clean or not self.args.dry_run:
-                self.send_state_msg({'op': 'rm',
-                                     'file': outf+self.extension
+                self.send_state_msg({'op': 'rm_failed',
+                                     'file': outf_base+self.extension
                                      })
-                os.unlink(outf+self.extension)
+                os.unlink(outf_base+self.extension)
+
+            # we failed converting this one earlier; try again
+            if ext.lower()[1:] in FAAD_EXT:
+              if os.path.isfile(outf_base+'.wav'):
+                msg = 'removing failed file:\n  -->  {}'.format(outf_base+'.wav')
+                if self.args.clean or self.args.verbose or self.args.dry_run: 
+                  print(msg)
+                if self.args.clean or not self.args.dry_run:
+                  self.send_state_msg({'op': 'rm_failed',
+                                       'file': outf_base+'.wav'
+                                       })
+                  os.unlink(outf_base+'.wav')
+ 
             
             # do work: transcode mp3; copy jpg and png
-            max_len = max(len(inf), len(outf)) # to right align
-            base_msg = ':\n       {1:>{0}}\n  -->  {2:>{0}}'.format(max_len, inf, outf)
             if self.args.clean: continue
             else:
-              outf_wrk = outf+self.extension
-              ext = os.path.splitext(outf)[1]
 
-              if ext.lower()[1:] in LAME_EXT:
-                if self.args.verbose or self.args.dry_run: print('transcode'+base_msg)
-                if self.args.dry_run: continue
-                self.send_state_msg({'op': 'transcode',
-                                     'infile': inf,
-                                     'outfile': outf,
-                                     })
+              # convert to .wav first, if needed
+              # this is really quick, so don't need to do a Popen
+              if ext.lower()[1:] in FAAD_EXT:
+                if self.args.verbose or self.args.dry_run:
+                  print('convert'+base_msg(inf, outf_base+'.wav'))
+                if not self.args.dry_run:
+                  self.send_state_msg({'op': 'transcode',
+                                       'infile': inf,
+                                       'outfile': outf_base+'.wav',
+                                       })
 
-                #TODO JMF 2017/04/25: if bitrate is less than target average bitrate, then 
-                #                     don't transcode.
-                #                     See the `mediainfo` package
-                
-                lame_args = ['lame']
-                lame_args.extend(self.args.lame_args.split())
-                lame_args.extend(('--disptime', str(self.args.disptime)))
-                lame_args.extend((inf, outf_wrk))
+                  subprocess.call(['faad', '--quiet', '-o', outf_base+'.wav', inf])
+
+                inf = outf_base+'.wav'
+              
+              # transcode mp3, copy images
+              if ext.lower()[1:] in TRANS_EXT:
+                outf = outf_base+'.mp3'
+                if self.args.verbose or self.args.dry_run:
+                  print('transcode'+base_msg(inf, outf))
+                if not self.args.dry_run:
+                  self.send_state_msg({'op': 'transcode',
+                                       'infile': inf,
+                                       'outfile': outf,
+                                       })
+
+                  #TODO JMF 2017/04/25: if bitrate is less than target average bitrate, then 
+                  #                     don't transcode.
+                  #                     See the `mediainfo` package
+                  
+                  lame_args = ['lame']
+                  lame_args.extend(self.args.lame_args.split())
+                  lame_args.extend(('--disptime', str(self.args.disptime)))
+                  lame_args.extend((inf, outf_wrk))
  
-                #subprocess.call(lame_args) # don't capture stdout
-                proc = subprocess.Popen(lame_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                  #subprocess.call(lame_args) # don't capture stdout
+                  proc = subprocess.Popen(lame_args,
+                                          stdout=subprocess.PIPE,
+                                          stderr=subprocess.STDOUT)
 
-                self.read_proc_stdout(proc, inf, outf)
-                
-                self.transcodes_done += 1
-                self.send_state_msg()
+                  self.read_proc_stdout(proc, inf, outf)
+                  
+                  self.transcodes_done += 1
+                  self.send_state_msg()
+
+                if ext.lower()[1:] in FAAD_EXT: # remove .wav
+                  if self.args.verbose or self.args.dry_run:
+                    msg = 'removing work file:\n  -->  {}'.format(
+                        outf_base+'.wav')
+                    print(msg)
+
+                  if not self.args.dry_run:
+                    self.send_state_msg({'op': 'rm_work',
+                                       'file': outf_base+'.wav',
+                                       })
+
+                    os.unlink(outf_base+'.wav')
                 
               elif ext.lower()[1:] in IMAGE_EXT:
-                if self.args.verbose or self.args.dry_run: print('copy'+base_msg)
+                if self.args.verbose or self.args.dry_run:
+                  print('copy'+base_msg(inf, outf))
                 if self.args.dry_run: continue
                 self.send_state_msg({'op': 'copy',
                                      'infile': inf,
@@ -465,18 +537,23 @@ class ConverterConsumer(mp.Process):
                 continue # unrecognized file, so do nothing
               
               # if the hard part (transcode/copy) was a success, remove .wrk extension
-              if os.path.isfile(outf_wrk):
-                os.rename(outf_wrk, outf)
-              else:
-                self.errors.append({'op': 'error',
-                                   'type': 'transcode_error',
-                                   'infile': inf,
-                                   'outfile': outf,
-                                   'details': 'Transcode failed (bad intput file?)'
-                                   })
+              if not self.args.dry_run:
+                if os.path.isfile(outf_wrk):
+                  os.rename(outf_wrk, outf)
+                else:
+                  self.errors.append({'op': 'error',
+                                     'type': 'transcode_error',
+                                     'infile': inf,
+                                     'outfile': outf,
+                                     'details': 'Transcode failed (bad intput file?)'
+                                     })
       
       except Exception as e:
-        print(e)
+        self.errors.append({'op': 'error',
+                           'type': 'unhandled_exception',
+                           'exception': e,
+                           })
+      
 
 
 #TODO JMF 2017/04/23: <Ctrl-C> grabber, so we can print warning to user then die?
@@ -495,6 +572,11 @@ def main(args):
     consumers.append(ConverterConsumer(args, files_q, info_q=info_q))
   
   producer = ConverterProducer(args, files_q, info_qs=info_qs)
+
+  if args.get_exts:
+    all_ext = producer.all_extensions()
+    pprint(all_ext)
+    return
   
   # start up processes
   producer.start()
@@ -509,7 +591,8 @@ def main(args):
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(
       description='Convert MP3 files from a directory tree to use average/'
-          'variable bitrate and copy the files to a cloned directory.')
+          'variable bitrate and copy the transcoded files to a cloned '
+          'directory tree.')
 
   # indir/outdir
   parser.add_argument('indir', type=str,
@@ -530,6 +613,8 @@ if __name__ == '__main__':
       help='Do a dry run of the processing, printing files to be converted')
   parser.add_argument('--verbose', action='store_true',
       help='Be verbose in the processing')
+  parser.add_argument('--get-exts', action='store_true',
+      help='Walk the input directory and print all unique file extensions.')
 
 
   #parser.add_argument('--lame-args', type=str, default='--abr 160 -b 96',
