@@ -5,6 +5,7 @@ a single thread, so we'll use `multiprocessing` to run transcoding in parallel.
 """
 
 import os, shutil, string, re, time
+from pprint import pprint
 import subprocess
 import multiprocessing as mp
 import multiprocessing.queues # to subclass mp.Queue()
@@ -12,9 +13,6 @@ import queue
 import curses
 import argparse
 
-# for debug/dev only
-from pprint import pprint
-  
 SENTINEL=None
 LAME_EXT=frozenset(['mp3', 'wav']) #TODO JMF 2017/04/29: what other types does lame handle?
 IMAGE_EXT=frozenset(['jpg', 'png'])
@@ -32,19 +30,12 @@ class _StateQueue(mp.queues.Queue):
 
   def put(self, *args, **kwargs):
     with self._state_lock:
-      #keep = [] # don't delete these items (bugfix race condition)
-      while not self.empty():
+      while not self.empty(): # clear the queue
         try:
           super().get(False)
-          #item = super().get(False)
-          #if 'msg' in item and item['msg'].get('op', '') == 'transcode_done':
-          #  print('keeping\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n')
-          #  keep.append(item)
-        except:
+        except queue.Empty:
           pass
-      #for item in keep:
-      #  super().put(*args, **kwargs)
-      super().put(*args, **kwargs)
+    super().put(*args, **kwargs)
   
   def get(self, *args, **kwargs):
     with self._state_lock:
@@ -71,6 +62,9 @@ class ConverterProducer(mp.Process):
     self.info_qs = info_qs
 
     self.worker_states = {}
+    self.finished_workers = set()
+
+    self.errors = []
 
     self.checkArgs()
 
@@ -113,9 +107,7 @@ class ConverterProducer(mp.Process):
     for info_q in self.info_qs:
       try:
         info_item = info_q.get(False)
-        if info_item is SENTINEL:
-          continue
-        else:
+        if info_item:
           self.worker_states[info_item['pid']] = info_item
       except queue.Empty:
         pass
@@ -127,6 +119,9 @@ class ConverterProducer(mp.Process):
       for worker, state in self.worker_states.items():
         num_done += state.get('transcodes_done', 0)
         finished = state.get('finished', False)
+
+        if finished and worker in self.finished_workers:
+          continue
 
         text = ''
         msg = state.get('msg', {})
@@ -141,6 +136,11 @@ class ConverterProducer(mp.Process):
           max_len = max(len(msg['infile']), len(msg['outfile'])) # to right align
           text = 'copy:\n      {1:>{0}}\n  -->  {2:>{0}}'.format(
               max_len, msg['infile'], msg['outfile'])
+
+        elif op == 'errors':
+          self.finished_workers.add(worker)
+          if msg['list']:
+            self.errors.extend(msg['list']) # msg['list'] is a list of errors
 
         elif op == 'transcode':
           max_len = max(len(msg['infile']), len(msg['outfile'])) # to right align
@@ -182,7 +182,7 @@ class ConverterProducer(mp.Process):
         if pad_h <= self.pad_h or pad_w <= self.pad_w: self.win.clrtobot()
 
         self.pad.erase()
-        #TODO this creaashes on X window resize
+        #TODO this crashes on X window resize
         self.pad.resize(max(pad_h,self.win_h), max(pad_w,self.win_w))
         self.pad_h, self.pad_w = pad_h, pad_w
 
@@ -247,6 +247,20 @@ class ConverterProducer(mp.Process):
     curses.echo()
     curses.endwin()
 
+  def show_errors(self):
+    for msg in self.errors:
+      t = msg.get('type','')
+      if t == 'transcode_error':
+        max_len = max(len(msg['infile']), len(msg['outfile'])) # to right align
+        text = '{3}:\n       {1:>{0}}\n  -->  {2:>{0}}'.format(
+            max_len, msg['infile'], msg['outfile'], msg['details'])
+        print(text)
+
+      else:
+        pprint(msg)
+      print()
+
+
   def run(self):
     self.num_done = 0
     self.num_todo = sum(map(lambda fns:\
@@ -281,6 +295,7 @@ class ConverterProducer(mp.Process):
 
     finally:
       if self.do_curses: self.finish_curses()
+      self.show_errors()
 
 
 class ConverterConsumer(mp.Process):
@@ -296,6 +311,7 @@ class ConverterConsumer(mp.Process):
 
     self.transcodes_done = 0
     self.finished = False
+    self.errors = []
     
     # From http://stackoverflow.com/a/38662876  
     self.ansi_escape = re.compile(r'(\x9B|\x1B\[)[0-?]*[ -\/]*[@-~]')
@@ -362,7 +378,7 @@ class ConverterConsumer(mp.Process):
         item = self.files_q.get(block=True)
         if item is SENTINEL:
           self.finished = True
-          self.send_state_msg()
+          self.send_state_msg({'op': 'errors', 'list': self.errors})
           return 
 
         if 'newpath' in item and 'infilenames' in item and 'outfilenames' in item:
@@ -422,15 +438,12 @@ class ConverterConsumer(mp.Process):
                 #                     don't transcode.
                 #                     See the `mediainfo` package
                 
-                #TODO JMF 2017/04/23: lame stuff
-                #TODO JMF 2017/04/23: what's the best function to use here?
-                #subprocess.call(['lame', '--quiet', '--abr', '160', '-b', '96', inf, outf_wrk])
                 lame_args = ['lame']
                 lame_args.extend(self.args.lame_args.split())
                 lame_args.extend(('--disptime', str(self.args.disptime)))
                 lame_args.extend((inf, outf_wrk))
  
-                #subprocess.call(lame_args)
+                #subprocess.call(lame_args) # don't capture stdout
                 proc = subprocess.Popen(lame_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
                 self.read_proc_stdout(proc, inf, outf)
@@ -452,7 +465,15 @@ class ConverterConsumer(mp.Process):
                 continue # unrecognized file, so do nothing
               
               # if the hard part (transcode/copy) was a success, remove .wrk extension
-              os.rename(outf_wrk, outf)
+              if os.path.isfile(outf_wrk):
+                os.rename(outf_wrk, outf)
+              else:
+                self.errors.append({'op': 'error',
+                                   'type': 'transcode_error',
+                                   'infile': inf,
+                                   'outfile': outf,
+                                   'details': 'Transcode failed (bad intput file?)'
+                                   })
       
       except Exception as e:
         print(e)
@@ -511,7 +532,6 @@ if __name__ == '__main__':
       help='Be verbose in the processing')
 
 
-  #TODO JMF 2017/04/23: lame parameters here, with sane defaults
   #parser.add_argument('--lame-args', type=str, default='--abr 160 -b 96',
   parser.add_argument('--lame-args', type=str, default='--preset medium',
       help='The optional arguments pased to `lame`.')
