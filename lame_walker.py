@@ -429,7 +429,7 @@ class ConverterConsumer(mp.Process):
             ext = os.path.splitext(inf)[1]
  
             # skip if outfile already exists
-            if os.path.isfile(outf):
+            if os.path.isfile(outf) or os.path.isfile(outf_base+'.mp3'):
               if not self.args.dry_run:
                 if os.path.splitext(outf)[1].lower()[1:] in LAME_EXT:
                   self.transcodes_done += 1 # for display only
