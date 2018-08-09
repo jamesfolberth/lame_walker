@@ -33,7 +33,8 @@ lame --preset medium input.mp3 output.mp3
 
 `lame_walker.py` is simply a wrapper around `lame` (and `faad`) to walk an input
 directory and call the transcoder in multiple processes using Python's `multiprocessing`
-module.
+module.  Using the default `--lame-arg` (`--preset medium`), I transcoded a 20 GB
+directory tree to about 15 GB.
 
 
 ## Prerequisites
