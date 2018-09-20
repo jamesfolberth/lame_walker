@@ -17,7 +17,7 @@ SENTINEL=None
 LAME_EXT=frozenset(['mp3', 'wav'])
 FAAD_EXT=frozenset(['m4a'])
 TRANS_EXT=LAME_EXT | FAAD_EXT # transcodable extensions
-IMAGE_EXT=frozenset(['jpg', 'png'])
+IMAGE_EXT=frozenset(['jpg', 'png', 'pdf'])
 
 class _StateQueue(mp.queues.Queue):
   """
