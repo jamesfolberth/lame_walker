@@ -616,8 +616,9 @@ if __name__ == '__main__':
   parser.add_argument('--get-exts', action='store_true',
       help='Walk the input directory and print all unique file extensions.')
 
-  #parser.add_argument('--lame-args', type=str, default='--abr 160 -b 96',
-  parser.add_argument('--lame-args', type=str, default='--preset medium',
+  #parser.add_argument('--lame-args', type=str, default='--abr 128 -b 64',
+  #parser.add_argument('--lame-args', type=str, default='--preset medium',
+  parser.add_argument('--lame-args', type=str, default='-V 7',
       help='The optional arguments pased to `lame`.')
   parser.add_argument('--disptime', type=float, default=0.1,
       help='The time between screen updates, which also overrides the `--disptime`'
