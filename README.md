@@ -11,13 +11,13 @@ have precious little storage on the new phone.  On my old phone, I had about 30
 GB of music on an SD card, but I didn't want to remove a bunch of songs from my
 collection.
 
-This tool ameliorates the (widespread) problem of not having an SD card to expand
-the music storage of your mobile phone.  With `lame_walker.py`, you can transcode your
-music files to `.mp3` files that use a lower average variable bitrate.  When I'm
-running, biking, etc., I don't need super high-fidelity audio (I also listen on
-cheap earbuds!), so we can pretty safely use a lower bitrate, which results in
-significantly smaller `.mp3` files.  Thus, I can store more songs per unit of
-storage on my phone.
+This tool ameliorates the (too widespread) problem of not having an SD card to
+expand the music storage of your mobile phone.  With `lame_walker.py`, you can
+transcode your music files to `.mp3` files that use a lower average variable
+bitrate.  When I'm running, biking, etc., I don't need super high-fidelity
+audio (I also listen on cheap earbuds!), so we can pretty safely use a lower
+bitrate, which results in significantly smaller `.mp3` files.  Thus, I can
+store more songs per unit of storage on my phone.
 
 The prototypical call to `lame` to transcode an input `.mp3` to a lower bitrate
 is something like
@@ -31,10 +31,27 @@ We can also use one of their presets:
 lame --preset medium input.mp3 output.mp3
 ```
 
+Or use the variable bit rate quality parameterization:
+
+```bash
+lame -V 7 input.mp3 output.mp3
+```
+
 `lame_walker.py` is simply a wrapper around `lame` (and `faad`) to walk an input
 directory and call the transcoder in multiple processes using Python's `multiprocessing`
 module.  Using the default `--lame-arg` (`--preset medium`), I transcoded a 20 GB
 directory tree to about 15 GB.
+
+
+Instead of using `lame_walker.py`, transcoding files in a directory could also
+be done with `find` and `xargs`.  The following one-liner will transcode the
+`.mp3`s in a directory **in place** using 16 processes.
+```bash
+find inoutdir -type f -name "*.mp3" -print0 | xargs -0r -P16 -n1 -I % bash -c 'lame -V 7 --quiet "%" "%.tmp" && mv "%.tmp" "%"'
+```
+
+But `lame_walker.py` shows `lame`'s pretty bitrate histograms, and hopefully
+offers a bit more safety and flexibility.
 
 
 ## Prerequisites
