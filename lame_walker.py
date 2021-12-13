@@ -86,7 +86,7 @@ class ConverterProducer(mp.Process):
     self.do_curses = not (self.args.verbose or self.args.dry_run)
 
   def filenames(self):
-    for dirpath, dirnames, filenames in os.walk(self.indir):
+    for dirpath, dirnames, filenames in os.walk(self.indir, followlinks=True):
       if filenames: # only care if files exist in dir; don't care about dirnames
         relpath = os.path.relpath(dirpath, self.indir)
 
@@ -170,10 +170,10 @@ class ConverterProducer(mp.Process):
 
       self.num_done = num_done
       msgs.sort(key=lambda t: t[0]) # sort by PID
-
+    
+      pct = 100.*self.num_done/self.num_todo if self.num_todo else 100.
       text = 'Percent complete: {2:3.1f}%  ({0:{3}d} of {1:{3}d})\n'.format(
-          self.num_done, self.num_todo, 100.*self.num_done/self.num_todo,
-          len(str(self.num_todo)))
+          self.num_done, self.num_todo, pct, len(str(self.num_todo)))
       text += '-'*len(text)+'\n'
       for i, msg in enumerate(msgs):
         text += 'Worker {0:4d}:\n{1}'.format(*msg)
