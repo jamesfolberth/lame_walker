@@ -1,9 +1,6 @@
 """
-A simpler script to walk a directory tree and transcode (`lame`, `faad`) audio files into a
-
-, call `lame` util on each MP3,
-and copy the converted file to a clone directory.  It looks like `lame` uses
-a single thread, so we'll use `multiprocessing` to run transcoding in parallel.
+A simple script to walk a directory tree and transcode (`lame`, `faad`) audio files into an output
+tree.
 """
 import argparse
 import logging
@@ -43,10 +40,6 @@ def worker(work):
 
     ifn = work['ifn']
     if 'cmd' == work['action']:
-        #p = subprocess.Popen(work['args'])
-        #p.wait()
-        #return p.returncode
-
         p = subprocess.run(work['args'], capture_output=True)
 
         work['returncode'] = p.returncode
