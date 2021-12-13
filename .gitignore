@@ -1,4 +1,4 @@
-in
-indir
-out
-outdir
+in*
+out*
+dirs*.txt
+.idea
